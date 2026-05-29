@@ -1,130 +1,144 @@
 #!/bin/bash
-# Backup genérico: DB dump + datos → comprimir → cifrar → pCloud
+# backup.sh — Backup de N carpetas + N bases de datos PostgreSQL
+#              → comprimir → cifrar (AES-256) → subir a pCloud
+#
+# Configuración 100% por variables de entorno.
+# Sin variables = sin backups.
 set -euo pipefail
 
-# ── Configuración de servicios ───────────────────────────
-# Añade aquí nuevos servicios copiando el bloque
-# db_*:   opcional — si no hay DB, pon db_host=""
-# dirs:   carpetas a incluir (separadas por espacio)
-# docker: nombre del contenedor si la DB corre en Docker (vacio si acceso directo)
-# ────────────────────────────────────────────────────────
+# ─── Cargar .env si existe ────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+[ -f "$SCRIPT_DIR/.env" ] && set -a && . "$SCRIPT_DIR/.env" && set +a
 
-SERVICES=()
+# ─── Globales (con defaults) ──────────────────────────────
+PCLOUD_REMOTE="${PCLOUD_REMOTE:-pcloud}"
+PCLOUD_PATH="${PCLOUD_PATH:-backups}"
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
+GPG_PASSPHRASE="${GPG_PASSPHRASE:-}"
 
-# Servicio 1: Immich
-IMMICH_NAME="immich"
-IMMICH_DB_HOST=""         # vacío porque usa Docker
-IMMICH_DB_PORT="5432"
-IMMICH_DB_USER="${IMMICH_DB_USERNAME:-immich}"
-IMMICH_DB_PASS="${IMMICH_DB_PASSWORD:-}"
-IMMICH_DB_NAME="${IMMICH_DB_DATABASE_NAME:-immich}"
-IMMICH_DB_DOCKER="immich-database"
-IMMICH_DIRS="/home/ismael/immich/data"
-SERVICES+=("IMMICH")
-
-# Servicio 2: Synology DB (PostgreSQL accesible por red)
-SYNO_NAME="synology-db"
-SYNO_DB_HOST="192.168.1.X"        # ← CAMBIAR IP del Synology
-SYNO_DB_PORT="5432"
-SYNO_DB_USER="usuario"
-SYNO_DB_PASS="contraseña"
-SYNO_DB_NAME="nombre_bd"
-SYNO_DB_DOCKER=""                  # acceso directo, no Docker
-SYNO_DIRS=""
-SERVICES+=("SYNO")
-
-# ── Config global ────────────────────────────────────────
-PCLOUD_REMOTE="pcloud"
-PCLOUD_PATH="backups"
 TMPDIR="/tmp/backup-$$"
-RETENTION_DAYS=30
-
-# ─────────────────────────────────────────────────────────
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT
 
-backup_service() {
-  local prefix="$1"
-  local name_var="${prefix}_NAME"
-  local db_host_var="${prefix}_DB_HOST"
-  local db_port_var="${prefix}_DB_PORT"
-  local db_user_var="${prefix}_DB_USER"
-  local db_pass_var="${prefix}_DB_PASS"
-  local db_name_var="${prefix}_DB_NAME"
-  local db_docker_var="${prefix}_DB_DOCKER"
-  local dirs_var="${prefix}_DIRS"
+# ─── Funciones ────────────────────────────────────────────
 
-  local name="${!name_var}"
-  local db_host="${!db_host_var}"
-  local db_port="${!db_port_var}"
-  local db_user="${!db_user_var}"
-  local db_pass="${!db_pass_var}"
-  local db_name="${!db_name_var}"
-  local db_docker="${!db_docker_var}"
-  local dirs="${!dirs_var}"
-
-  local srcdir="$TMPDIR/$name"
-  mkdir -p "$srcdir"
-
-  ARCHIVE="$TMPDIR/${name}-backup-${TIMESTAMP}.tar.gz"
-  ENCRYPTED="${ARCHIVE}.gpg"
-
-  echo "── $name ──"
-
-  # 1. Dump DB
-  if [ -n "$db_host" ] || [ -n "$db_docker" ]; then
-    echo "  [1/4] Dumping database…"
-    local dump_cmd="pg_dump -U $db_user -d $db_name --clean --if-exists --no-owner"
-    if [ -n "$db_docker" ]; then
-      docker exec "$db_docker" bash -c "PGPASSWORD='$db_pass' $dump_cmd" > "$srcdir/db-dump.sql"
-    else
-      PGPASSWORD="$db_pass" $dump_cmd -h "$db_host" -p "$db_port" > "$srcdir/db-dump.sql" 2>/dev/null
-    fi
+gpg_cipher() {
+  if [ -n "$GPG_PASSPHRASE" ]; then
+    gpg --batch --passphrase "$GPG_PASSPHRASE" --symmetric --cipher-algo AES256 "$@"
   else
-    echo "  [1/4] No database configured, skipping."
+    gpg --symmetric --cipher-algo AES256 "$@"
   fi
-
-  # 2. Copiar directorios
-  if [ -n "$dirs" ]; then
-    echo "  [2/4] Copying data directories…"
-    for d in $dirs; do
-      if [ -d "$d" ]; then
-        local basename=$(basename "$d")
-        rsync -a --info=progress2 "$d"/ "$srcdir/$basename/"
-      fi
-    done
-  else
-    echo "  [2/4] No data directories configured."
-  fi
-
-  # 3. Comprimir
-  echo "  [3/4] Compressing…"
-  tar -czf "$ARCHIVE" -C "$srcdir" .
-
-  # 4. Cifrar
-  echo "  [4/4] Encrypting…"
-  gpg --symmetric --cipher-algo AES256 --output "$ENCRYPTED" "$ARCHIVE"
-
-  # 5. Subir
-  echo "  Uploading to pCloud…"
-  remote_path="${PCLOUD_REMOTE}:${PCLOUD_PATH}/${name}/"
-  rclone copy "$ENCRYPTED" "$remote_path"
-
-  echo "  Done: ${remote_path}${name}-backup-${TIMESTAMP}.tar.gz.gpg"
 }
 
-# ── Ejecutar todos los servicios ─────────────────────────
-for svc in "${SERVICES[@]}"; do
-  backup_service "$svc"
+upload_and_cleanup() {
+  local name="$1"
+  local archive="$2"
+  local remote_path="${PCLOUD_REMOTE}:${PCLOUD_PATH}/${name}/"
+
+  rclone copy "$archive" "$remote_path"
+  echo "  -> ${remote_path}$(basename "$archive")"
+  rclone delete --min-age "${RETENTION_DAYS}d" "$remote_path" 2>/dev/null || true
+}
+
+backup_folder() {
+  local name="$1"
+  local path="$2"
+  local srcdir="$TMPDIR/$name"
+  local archive="$TMPDIR/${name}-${TIMESTAMP}.tar.gz"
+  local encrypted="${archive}.gpg"
+
+  echo "── Folder: $name ──"
+  mkdir -p "$srcdir"
+
+  if [ ! -d "$path" ]; then
+    echo "  ⚠ Directory not found: $path, skipping."
+    return
+  fi
+
+  echo "  [1/3] Copying files…"
+  rsync -a "$path"/ "$srcdir/"
+
+  echo "  [2/3] Compressing…"
+  tar -czf "$archive" -C "$srcdir" .
+
+  echo "  [3/3] Encrypting…"
+  gpg_cipher --output "$encrypted" "$archive"
+
+  upload_and_cleanup "$name" "$encrypted"
+  echo "  ✓ Done"
+}
+
+backup_postgres() {
+  local name="$1"
+  local host="$2"
+  local port="$3"
+  local user="$4"
+  local pass="$5"
+  local database="$6"
+  local connector="$7"  # "docker" | "network"
+  local srcdir="$TMPDIR/$name"
+  local archive="$TMPDIR/${name}-${TIMESTAMP}.tar.gz"
+  local encrypted="${archive}.gpg"
+
+  echo "── PostgreSQL: $name ──"
+  mkdir -p "$srcdir"
+
+  echo "  [1/3] Dumping database…"
+  local dump_cmd="pg_dump -U $user -d $database --clean --if-exists --no-owner"
+  if [ "$connector" = "docker" ]; then
+    docker exec "$host" bash -c "PGPASSWORD='$pass' $dump_cmd" > "$srcdir/db-dump.sql"
+  else
+    PGPASSWORD="$pass" $dump_cmd -h "$host" -p "$port" > "$srcdir/db-dump.sql"
+  fi
+
+  echo "  [2/3] Compressing…"
+  tar -czf "$archive" -C "$srcdir" .
+
+  echo "  [3/3] Encrypting…"
+  gpg_cipher --output "$encrypted" "$archive"
+
+  upload_and_cleanup "$name" "$encrypted"
+  echo "  ✓ Done"
+}
+
+# ─── Descubrimiento dinámico de backups ──────────────────
+# Folder: FOLDER_BACKUP_<N>_NAME + FOLDER_BACKUP_<N>_PATH
+# Postgres: DB_BACKUP_<N>_NAME + _HOST + _PORT + _USER + _PASS + _DATABASE + _TYPE
+
+i=1
+while :; do
+  name_var="FOLDER_BACKUP_${i}_NAME"
+  path_var="FOLDER_BACKUP_${i}_PATH"
+  name="${!name_var:-}"
+  path="${!path_var:-}"
+  [ -z "$name" ] && break
+  backup_folder "$name" "$path"
+  i=$((i + 1))
 done
 
-# Limpieza remota (por servicio)
-for svc in "${SERVICES[@]}"; do
-  local name_var="${svc}_NAME"
-  local name="${!name_var}"
-  rclone delete --min-age "${RETENTION_DAYS}d" "${PCLOUD_REMOTE}:${PCLOUD_PATH}/${name}/" 2>/dev/null || true
+i=1
+while :; do
+  name_var="DB_BACKUP_${i}_NAME"
+  host_var="DB_BACKUP_${i}_HOST"
+  port_var="DB_BACKUP_${i}_PORT"
+  user_var="DB_BACKUP_${i}_USER"
+  pass_var="DB_BACKUP_${i}_PASS"
+  db_var="DB_BACKUP_${i}_DATABASE"
+  type_var="DB_BACKUP_${i}_TYPE"
+
+  name="${!name_var:-}"
+  host="${!host_var:-}"
+  port="${!port_var:-5432}"
+  user="${!user_var:-}"
+  pass="${!pass_var:-}"
+  database="${!db_var:-}"
+  connector="${!type_var:-}"
+
+  [ -z "$name" ] && break
+  backup_postgres "$name" "$host" "$port" "$user" "$pass" "$database" "$connector"
+  i=$((i + 1))
 done
 
 echo "✅ Todos los backups completados."
