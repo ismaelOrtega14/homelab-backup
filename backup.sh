@@ -57,7 +57,7 @@ backup_folder() {
   fi
 
   echo "  [1/3] Copying files…"
-  rsync -a "$path"/ "$srcdir/"
+  cp -a "$path"/. "$srcdir/"
 
   echo "  [2/3] Compressing…"
   tar -czf "$archive" -C "$srcdir" .
