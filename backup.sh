@@ -15,8 +15,7 @@ PCLOUD_REMOTE="${PCLOUD_REMOTE:-pcloud}"
 PCLOUD_PATH="${PCLOUD_PATH:-backups}"
 RETENTION_DAYS="${RETENTION_DAYS:-30}"
 GPG_PASSPHRASE="${GPG_PASSPHRASE:-}"
-
-TMPDIR="/tmp/backup-$$"
+TMPDIR="${TMPDIR_BASE:-/tmp}/backup-$$"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 cleanup() { rm -rf "$TMPDIR"; }
